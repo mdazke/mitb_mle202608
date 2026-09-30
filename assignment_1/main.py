@@ -16,6 +16,9 @@ from pyspark.sql.types import StringType, IntegerType, FloatType, DateType
 import utils.data_processing_bronze_table
 import utils.data_processing_silver_table
 import utils.data_processing_gold_table
+import utils.data_processing_bronze_feature_table
+import utils.data_processing_silver_feature_table
+import utils.data_processing_gold_feature_table
 
 
 # Initialize SparkSession
@@ -101,5 +104,66 @@ print("row_count:",df.count())
 df.show()
 
 
+# ---------------- feature store ----------------
+# attributes / financials are captured once per customer at loan application, clickstream is monthly
+feature_end_date_str = "2025-01-01"
+feature_dates_str_lst = generate_first_of_month_dates(start_date_str, feature_end_date_str)
+print(feature_dates_str_lst)
 
-    
+# raw sources: name -> csv file
+feature_sources = {
+    "clickstream": "data/feature_clickstream.csv",
+    "attributes": "data/features_attributes.csv",
+    "financials": "data/features_financials.csv",
+}
+
+# create bronze datalake
+bronze_feature_directories = {}
+for source_name in feature_sources:
+    bronze_feature_directories[source_name] = "datamart/bronze/" + source_name + "/"
+    if not os.path.exists(bronze_feature_directories[source_name]):
+        os.makedirs(bronze_feature_directories[source_name])
+
+# run bronze backfill
+for date_str in feature_dates_str_lst:
+    for source_name, csv_file_path in feature_sources.items():
+        utils.data_processing_bronze_feature_table.process_bronze_feature_table(date_str, source_name, csv_file_path, bronze_feature_directories[source_name], spark)
+
+
+# create silver datalake
+silver_clickstream_directory = "datamart/silver/clickstream/"
+silver_attributes_directory = "datamart/silver/attributes/"
+silver_financials_directory = "datamart/silver/financials/"
+
+for directory in [silver_clickstream_directory, silver_attributes_directory, silver_financials_directory]:
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+# run silver backfill
+for date_str in feature_dates_str_lst:
+    utils.data_processing_silver_feature_table.process_silver_clickstream_table(date_str, bronze_feature_directories["clickstream"], silver_clickstream_directory, spark)
+    utils.data_processing_silver_feature_table.process_silver_attributes_table(date_str, bronze_feature_directories["attributes"], silver_attributes_directory, spark)
+    utils.data_processing_silver_feature_table.process_silver_financials_table(date_str, bronze_feature_directories["financials"], silver_financials_directory, spark)
+
+
+# create gold datalake
+gold_feature_store_directory = "datamart/gold/feature_store/"
+
+if not os.path.exists(gold_feature_store_directory):
+    os.makedirs(gold_feature_store_directory)
+
+# run gold backfill
+for date_str in feature_dates_str_lst:
+    utils.data_processing_gold_feature_table.process_features_gold_table(date_str, silver_attributes_directory, silver_financials_directory, silver_clickstream_directory, gold_feature_store_directory, spark)
+
+
+folder_path = gold_feature_store_directory
+files_list = [folder_path+os.path.basename(f) for f in glob.glob(os.path.join(folder_path, '*'))]
+df_features = spark.read.option("header", "true").parquet(*files_list)
+print("row_count:",df_features.count())
+
+df_features.show()
+
+# sanity check: features join to labels 1:1 on loan_id (labels only exist for loans that reached 6 months on book)
+df_labels = spark.read.parquet(*[gold_label_store_directory+os.path.basename(f) for f in glob.glob(os.path.join(gold_label_store_directory, '*'))])
+print("labelled rows:", df_labels.count(), "matched to features:", df_labels.join(df_features, on="loan_id", how="inner").count())
